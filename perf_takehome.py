@@ -358,8 +358,7 @@ class KernelBuilder:
         all_slots.extend(pre_slots)
         
         # We process batches in groups of K to fill the pipeline
-        K = 27
-        ADDR_TEMPS = 3
+        K = 29
         num_vec_batches = batch_size // VLEN
         
         # Scratch registers for the loop
@@ -370,7 +369,6 @@ class KernelBuilder:
                 "v_tmp1": self.alloc_scratch(f"v_tmp1_{k}", VLEN),
                 "v_tmp2": self.alloc_scratch(f"v_tmp2_{k}", VLEN),
                 "v_node_vals": self.alloc_scratch(f"v_node_vals_{k}", VLEN),
-                "v_target_node_addrs": [self.alloc_scratch(f"node_addr_{k}_{vi}") for vi in range(ADDR_TEMPS)],
             }
             batch_temps.append(temps)
 
@@ -396,34 +394,31 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        for round in range(rounds):
-            level = round % (forest_height + 1)
-            level_base = None
-            if level >= 3:
-                level_base = self.scratch_const(7 + (1 << level) - 1)
+        # Wavefront schedule across rounds and batches to overlap loads with compute
+        for i_base in range(0, num_vec_batches, K):
+            k_end = min(K, num_vec_batches - i_base)
+            for t in range(rounds + k_end - 1):
+                for k in range(k_end):
+                    r = t - k
+                    if r < 0 or r >= rounds:
+                        continue
 
-            for i_base in range(0, num_vec_batches, K):
-                k_end = min(K, num_vec_batches - i_base)
+                    level = r % (forest_height + 1)
+                    level_base = None
+                    if level >= 3:
+                        level_base = self.scratch_const(7 + (1 << level) - 1)
 
-                # 1. Gather all node values for K batches
-                if level == 0:
-                    # Round 0: broadcast root value
-                    for k in range(k_end):
-                        temps = batch_temps[k]
+                    i = i_base + k
+                    temps = batch_temps[k]
+
+                    # 1. Gather node value for this batch/round
+                    if level == 0:
                         all_slots.append(("valu", ("+", temps["v_node_vals"], v_root_val, zero_v)))
-                elif level == 1:
-                    # Round 1: select between val1 and val2 based on index
-                    for k in range(k_end):
-                        i = i_base + k
-                        temps = batch_temps[k]
+                    elif level == 1:
                         all_slots.append(
                             ("flow", ("vselect", temps["v_node_vals"], v_indices[i], v_node_val_2, v_node_val_1))
                         )
-                elif level == 2:
-                    # Round 2: select among cached nodes 3..6
-                    for k in range(k_end):
-                        i = i_base + k
-                        temps = batch_temps[k]
+                    elif level == 2:
                         # rel is already in range 0..3, select via two bits
                         all_slots.append(("valu", ("&", temps["v_tmp2"], v_indices[i], one_v)))  # bit0
                         all_slots.append(("valu", (">>", temps["v_tmp1"], v_indices[i], one_v)))  # bit1
@@ -439,47 +434,25 @@ class KernelBuilder:
                         all_slots.append(
                             ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], temps["v_tmp2"], temps["v_node_vals"]))
                         )
-                else:
-                    # Regular gather (use level base + rel)
-                    for k in range(k_end):
-                        i = i_base + k
-                        temps = batch_temps[k]
+                    else:
+                        # Regular gather (use level base + rel)
                         for vi in range(VLEN):
                             v_idx_addr = v_indices[i] + vi
-                            addr_tmp = temps["v_target_node_addrs"][vi % ADDR_TEMPS]
-                            all_slots.append(("alu", ("+", addr_tmp, level_base, v_idx_addr)))
-                            all_slots.append(("load", ("load", temps["v_node_vals"] + vi, addr_tmp)))
-                
-                # 2. XOR (val ^ node_val) for K batches
-                for k in range(K):
-                    if i_base + k >= num_vec_batches: break
-                    i = i_base + k
-                    temps = batch_temps[k]
+                            all_slots.append(("alu", ("+", temps["v_tmp1"] + vi, level_base, v_idx_addr)))
+                        for vi in range(VLEN):
+                            all_slots.append(("load", ("load_offset", temps["v_node_vals"], temps["v_tmp1"], vi)))
+
+                    # 2. XOR (val ^ node_val)
                     all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
 
-                # 3. Hash for K batches - Interleaved stages
-                # To maximize parallelism, we can interleave the stages across batches?
-                # Actually, simply appending to all_slots let the packer do the interleaving.
-                # The packer is greedy, so valid ops from later batches will fill holes in earlier ones.
-                for k in range(K):
-                    if i_base + k >= num_vec_batches: break
-                    i = i_base + k
-                    temps = batch_temps[k]
+                    # 3. Hash
                     all_slots.extend(self.build_hash_vec(v_values[i], temps["v_tmp1"], temps["v_tmp2"]))
-                
-                # 4. Update indices for K batches (not needed after final round)
-                if round != rounds - 1:
-                    for k in range(K):
-                        if i_base + k >= num_vec_batches:
-                            break
-                        i = i_base + k
-                        temps = batch_temps[k]
 
+                    # 4. Update indices (not needed after final round)
+                    if r != rounds - 1:
                         if level == forest_height:
-                            # At leaf level, next index always wraps to 0.
                             all_slots.append(("valu", ("+", v_indices[i], zero_v, zero_v)))
                         else:
-                            # rel = 2*rel + (val & 1)
                             all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
                             all_slots.append(("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"])))
 
