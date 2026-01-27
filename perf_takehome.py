@@ -255,7 +255,26 @@ class KernelBuilder:
 
     def build_hash_vec(self, v_val_addr, v_tmp1, v_tmp2):
         slots = []
-        for op1, val1, op2, op3, val3 in HASH_STAGES:
+        for i, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if i == 0:
+                # Stage 0: a * 4097 + val1
+                vv_mul = self.v_const(4097)
+                vv_add = self.v_const(val1)
+                slots.append(("valu", ("multiply_add", v_val_addr, v_val_addr, vv_mul, vv_add)))
+                continue
+            elif i == 2:
+                # Stage 2: a * 33 + val1
+                vv_mul = self.v_const(33)
+                vv_add = self.v_const(val1)
+                slots.append(("valu", ("multiply_add", v_val_addr, v_val_addr, vv_mul, vv_add)))
+                continue
+            elif i == 4:
+                # Stage 4: a * 9 + val1
+                vv_mul = self.v_const(9)
+                vv_add = self.v_const(val1)
+                slots.append(("valu", ("multiply_add", v_val_addr, v_val_addr, vv_mul, vv_add)))
+                continue
+                
             vv1 = self.v_const(val1)
             vv3 = self.v_const(val3)
             slots.append(("valu", (op1, v_tmp1, v_val_addr, vv1)))
@@ -343,6 +362,20 @@ class KernelBuilder:
             batch_temps.append(temps)
 
         for round in range(rounds):
+            nodes_count = 1 << round
+            round_broadcasted_nodes = []
+            
+            # Limit nodes_count <= 8 to fit in scratch RAM with 16-way interleave
+            # do_mux_opt = (nodes_count <= 8) and (round > 0)
+            # Dead code removed to restore clean state
+            pass
+
+            t_root_val = None
+            if round == 0:
+                 # Load root value
+                 t_root_val = self.alloc_scratch("root_val_tmp")
+                 all_slots.append(("load", ("load", t_root_val, self.scratch["forest_values_p"])))
+
             for i_base in range(0, num_vec_batches, K):
                 # Interleave operations for K batches
                 # 1. Gather all node values for K batches
@@ -351,10 +384,26 @@ class KernelBuilder:
                     i = i_base + k
                     temps = batch_temps[k]
                     
-                    for vi in range(VLEN):
-                        v_idx_addr = v_indices[i] + vi
-                        all_slots.append(("alu", ("+", temps["v_target_node_addrs"][vi], self.scratch["forest_values_p"], v_idx_addr)))
-                        all_slots.append(("load", ("load", temps["v_node_vals"] + vi, temps["v_target_node_addrs"][vi])))
+                    if round == 0:
+                         # Round 0 optimization: All indices are 0.
+                         # Just load root value once and broadcast.
+                         pass # handled below
+                    else:
+                        for vi in range(VLEN):
+                            v_idx_addr = v_indices[i] + vi
+                            all_slots.append(("alu", ("+", temps["v_target_node_addrs"][vi], self.scratch["forest_values_p"], v_idx_addr)))
+                            all_slots.append(("load", ("load", temps["v_node_vals"] + vi, temps["v_target_node_addrs"][vi])))
+                
+                if round == 0:
+                    # Optimized Gather for Round 0
+                    # Load root value (index 0)
+                    t_root_val = self.alloc_scratch("root_val_tmp")
+                    all_slots.append(("load", ("load", t_root_val, self.scratch["forest_values_p"])))
+                    for k in range(K):
+                        if i_base + k >= num_vec_batches: break
+                        i = i_base + k
+                        temps = batch_temps[k]
+                        all_slots.append(("valu", ("vbroadcast", temps["v_node_vals"], t_root_val)))
                 
                 # 2. XOR (val ^ node_val) for K batches
                 for k in range(K):
