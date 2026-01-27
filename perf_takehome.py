@@ -319,34 +319,60 @@ class KernelBuilder:
         one_v = self.v_const(1)
         two_v = self.v_const(2)
         n_nodes_v = self.v_const(n_nodes)
-        
-        # Load the entire batch of indices and values into scratch
-        # This reduces repetitive address calculation and memory pressure.
-        v_indices = []
-        v_values = []
-        for i in range(batch_size // VLEN):
-            v_idx = self.alloc_scratch(f"indices_batch_{i}", VLEN)
-            v_val = self.alloc_scratch(f"values_batch_{i}", VLEN)
-            v_indices.append(v_idx)
-            v_values.append(v_val)
 
-        tmp_addr = self.alloc_scratch("tmp_addr")
-        for i in range(batch_size // VLEN):
-            # Load indices: mem[inp_indices_p + i*VLEN]
-            offset = i * VLEN
-            self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], self.scratch_const(offset)))
-            self.add("load", ("vload", v_indices[i], tmp_addr))
-            # Load values: mem[inp_values_p + i*VLEN]
-            self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], self.scratch_const(offset)))
-            self.add("load", ("vload", v_values[i], tmp_addr))
+        # Allocate scratch for early round optimization
+        t_root_val = self.alloc_scratch("root_val_tmp")
+        t_node_val_1 = self.alloc_scratch("t_node_val_1")
+        t_node_val_2 = self.alloc_scratch("t_node_val_2")
+        t_addr_early = self.alloc_scratch("t_addr_early")
+        v_root_val = self.alloc_scratch("v_root_val", VLEN)
+        v_node_val_1 = self.alloc_scratch("v_node_val_1", VLEN)
+        v_node_val_2 = self.alloc_scratch("v_node_val_2", VLEN)
 
-        self.add("flow", ("pause",))
+        # Preload level-2 and level-3 nodes into vector scratch (broadcasted)
+        t_cache_addr = self.alloc_scratch("t_cache_addr")
+        t_cache_val = self.alloc_scratch("t_cache_val")
+        v_cache_l2 = self.alloc_scratch("v_cache_l2", 4 * VLEN)  # idx 3..6
+        v_idx_l2 = [self.v_const(3 + i) for i in range(4)]
 
         # Main loop bodies
         all_slots = []
+        # Preload cached node values in the packed region to reduce init cost
+        pre_slots = []
+        pre_slots.append(("load", ("load", t_root_val, self.scratch["forest_values_p"])))
+        pre_slots.append(
+            ("alu", ("+", t_addr_early, self.scratch["forest_values_p"], self.scratch_const(1)))
+        )
+        pre_slots.append(("load", ("load", t_node_val_1, t_addr_early)))
+        pre_slots.append(
+            ("alu", ("+", t_addr_early, self.scratch["forest_values_p"], self.scratch_const(2)))
+        )
+        pre_slots.append(("load", ("load", t_node_val_2, t_addr_early)))
+        pre_slots.append(("valu", ("vbroadcast", v_root_val, t_root_val)))
+        pre_slots.append(("valu", ("vbroadcast", v_node_val_1, t_node_val_1)))
+        pre_slots.append(("valu", ("vbroadcast", v_node_val_2, t_node_val_2)))
+
+        for i in range(4):
+            node_idx = 3 + i
+            pre_slots.append(
+                (
+                    "alu",
+                    (
+                        "+",
+                        t_cache_addr,
+                        self.scratch["forest_values_p"],
+                        self.scratch_const(node_idx),
+                    ),
+                )
+            )
+            pre_slots.append(("load", ("load", t_cache_val, t_cache_addr)))
+            pre_slots.append(
+                ("valu", ("vbroadcast", v_cache_l2 + i * VLEN, t_cache_val))
+            )
+        all_slots.extend(pre_slots)
         
         # We process batches in groups of K to fill the pipeline
-        K = 16
+        K = 20
         num_vec_batches = batch_size // VLEN
         
         # Scratch registers for the loop
@@ -361,42 +387,64 @@ class KernelBuilder:
             }
             batch_temps.append(temps)
 
-        # Allocate scratch for early round optimization
-        t_node_val_1 = self.alloc_scratch("t_node_val_1")
-        t_node_val_2 = self.alloc_scratch("t_node_val_2")
-        t_addr_early = self.alloc_scratch("t_addr_early")
+        # Load the entire batch of indices and values into scratch
+        # This reduces repetitive address calculation and memory pressure.
+        v_indices = []
+        v_values = []
+        for i in range(batch_size // VLEN):
+            v_idx = self.alloc_scratch(f"indices_batch_{i}", VLEN)
+            v_val = self.alloc_scratch(f"values_batch_{i}", VLEN)
+            v_indices.append(v_idx)
+            v_values.append(v_val)
+
+        tmp_addr = self.alloc_scratch("tmp_addr")
+        for i in range(batch_size // VLEN):
+            # Load indices: mem[inp_indices_p + i*VLEN]
+            offset = i * VLEN
+            self.add(
+                "alu",
+                ("+", tmp_addr, self.scratch["inp_indices_p"], self.scratch_const(offset)),
+            )
+            self.add("load", ("vload", v_indices[i], tmp_addr))
+            # Load values: mem[inp_values_p + i*VLEN]
+            self.add(
+                "alu",
+                ("+", tmp_addr, self.scratch["inp_values_p"], self.scratch_const(offset)),
+            )
+            self.add("load", ("vload", v_values[i], tmp_addr))
+
+        self.add("flow", ("pause",))
 
         for round in range(rounds):
-            if round == 0:
-                # Round 0: All indices are 0, load root once
-                t_root_val = self.alloc_scratch("root_val_tmp")
-                all_slots.append(("load", ("load", t_root_val, self.scratch["forest_values_p"])))
-            elif round == 1:
-                # Round 1: Indices are 1 or 2. Preload both values.
-                all_slots.append(("alu", ("+", t_addr_early, self.scratch["forest_values_p"], self.scratch_const(1))))
-                all_slots.append(("load", ("load", t_node_val_1, t_addr_early)))
-                all_slots.append(("alu", ("+", t_addr_early, self.scratch["forest_values_p"], self.scratch_const(2))))
-                all_slots.append(("load", ("load", t_node_val_2, t_addr_early)))
+            level = round % (forest_height + 1)
 
             for i_base in range(0, num_vec_batches, K):
                 k_end = min(K, num_vec_batches - i_base)
 
                 # 1. Gather all node values for K batches
-                if round == 0:
+                if level == 0:
                     # Round 0: broadcast root value
                     for k in range(k_end):
                         temps = batch_temps[k]
-                        all_slots.append(("valu", ("vbroadcast", temps["v_node_vals"], t_root_val)))
-                elif round == 1:
+                        all_slots.append(("valu", ("+", temps["v_node_vals"], v_root_val, zero_v)))
+                elif level == 1:
                     # Round 1: select between val1 and val2 based on index
                     for k in range(k_end):
                         i = i_base + k
                         temps = batch_temps[k]
                         all_slots.append(("valu", ("==", temps["v_tmp1"], v_indices[i], one_v)))
-                        all_slots.append(("valu", ("vbroadcast", temps["v_node_vals"], t_node_val_1)))
-                        all_slots.append(("valu", ("vbroadcast", temps["v_tmp2"], t_node_val_2)))
-                        all_slots.append(("valu", ("-", temps["v_node_vals"], temps["v_node_vals"], temps["v_tmp2"])))
-                        all_slots.append(("valu", ("multiply_add", temps["v_node_vals"], temps["v_tmp1"], temps["v_node_vals"], temps["v_tmp2"])))
+                        all_slots.append(("valu", ("+", temps["v_node_vals"], v_node_val_1, zero_v)))
+                        all_slots.append(("valu", ("-", temps["v_node_vals"], temps["v_node_vals"], v_node_val_2)))
+                        all_slots.append(("valu", ("multiply_add", temps["v_node_vals"], temps["v_tmp1"], temps["v_node_vals"], v_node_val_2)))
+                elif level == 2:
+                    # Round 2: select among cached nodes 3..6
+                    for k in range(k_end):
+                        i = i_base + k
+                        temps = batch_temps[k]
+                        all_slots.append(("valu", ("+", temps["v_node_vals"], zero_v, zero_v)))
+                        for j in range(4):
+                            all_slots.append(("valu", ("==", temps["v_tmp1"], v_indices[i], v_idx_l2[j])))
+                            all_slots.append(("valu", ("multiply_add", temps["v_node_vals"], temps["v_tmp1"], v_cache_l2 + j * VLEN, temps["v_node_vals"])))
                 else:
                     # Regular gather
                     for k in range(k_end):
