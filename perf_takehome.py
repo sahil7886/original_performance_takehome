@@ -146,64 +146,83 @@ class KernelBuilder:
         return reads, writes
 
     def pack(self, slots: list[tuple[Engine, tuple]]):
-        instrs = []
-        current_instr = defaultdict(list)
-        # Track what has been written/read in the current instruction bundle
-        current_writes = set()
-        current_reads = set()
+        schedule = [] # List of dict[engine, list[op]]
+        # Track usage per cycle: index -> dict[engine, count]
+        cycle_counts = [] 
         
+        # Track dependencies
+        # map addr -> cycle index of last write
+        last_write = {} 
+        # map addr -> cycle index of last read
+        last_read = {} 
+
         for slot in slots:
             engine, op = slot
             reads, writes = self.get_io(slot)
             
-            # Check 1: Resource Limits
-            if len(current_instr[engine]) >= SLOT_LIMITS[engine]:
-                instrs.append(dict(current_instr))
-                current_instr = defaultdict(list)
-                current_writes = set()
-                current_reads = set()
+            start_cycle = 0
             
-            # Check 2: Data Hazard (RAW, WAR, WAW) within the SAME cycle
-            # In this architecture (VLIW), all reads happen at start of cycle, all writes at end.
-            # So:
-            # - Write-After-Read (WAR) is OK: (read x, write x) -> Old x is read, new x is written.
-            # - Read-After-Write (RAW) is BAD: (write x, read x) -> The read would get OLD x, not results of write.
-            # - Write-After-Write (WAW) is BAD: (write x, write x) -> Race condition.
-            
-            conflict = False
-            
-            # RAW Hazard: Does this slot READ something that is being WRITTEN in this cycle?
-            if not reads.isdisjoint(current_writes):
-                conflict = True
+            # Barrier for pause/halt
+            if engine == "flow" and op[0] in ("pause", "halt"):
+                start_cycle = len(schedule)
+            else:
+                # RAW: Must be after last write of any input
+                # Simulator: Reads happen at START of cycle.
+                # So if Write at T, Read can be at T+1.
+                for r in reads:
+                    if r in last_write:
+                        start_cycle = max(start_cycle, last_write[r] + 1)
                 
-            # WAW & RAW (Inverse): Does this slot WRITE something that is being READ or WRITTEN?
-            # Actually, if we write X, and a previous op in this cycle reads X, that is OK (WAR).
-            # But if a previous op writes X, that is bad (WAW).
-            if not writes.isdisjoint(current_writes):
-                conflict = True
+                # WAW: Must be after last write of any output
+                for w in writes:
+                    if w in last_write:
+                        start_cycle = max(start_cycle, last_write[w] + 1)
                 
-            # SPECIAL CASE: Flow/Control instructions.
-            # If we have a jump, we can't pack anything after it usually, or it gets complicated.
-            # In this sim, "flow" is just another unit, but let's be safe: 
-            # If we see a jump/branch, we might want to start a new bundle to verify behavior.
-            # The sim says: "Effects of instructions don't take effect until the end of cycle."
-            # So a jump and an ALU op in parallel is fine.
+                # WAR: Can be same cycle as last read.
+                # If Read at T, Write can be at T.
+                # But Write cannot be at T-1?
+                # Actually, if I write at T, it takes effect at End of T.
+                # The read at T reads old value.
+                # So they can be concurrent.
+                # But I cannot write at T if Read is at T+1 (that would be RAW violation for the reader).
+                # But here we are scheduling the Writer AFTER the Reader seen in stream.
+                # So Writer must be >= Reader Cycle.
+                for w in writes:
+                    if w in last_read:
+                        start_cycle = max(start_cycle, last_read[w])
             
-            if conflict:
-                instrs.append(dict(current_instr))
-                current_instr = defaultdict(list)
-                current_writes = set()
-                current_reads = set()
+            # Find first cycle >= start_cycle that has resources
+            while True:
+                # Ensure schedule has space
+                while start_cycle >= len(schedule):
+                    schedule.append(defaultdict(list))
+                    cycle_counts.append(defaultdict(int))
+                
+                # Check limits
+                cc = cycle_counts[start_cycle]
+                if cc[engine] < SLOT_LIMITS[engine]:
+                    # Fits!
+                    break
+                start_cycle += 1
             
-            # Add to bundle
-            current_instr[engine].append(op)
-            current_writes.update(writes)
-            current_reads.update(reads)
+            # Schedule it
+            schedule[start_cycle][engine].append(op)
+            cycle_counts[start_cycle][engine] += 1
+            
+            # Update dependencies
+            for r in reads:
+                # We record the latest read cycle
+                curr = last_read.get(r, -1)
+                if start_cycle > curr:
+                    last_read[r] = start_cycle
+            for w in writes:
+                # We record the latest write cycle
+                curr = last_write.get(w, -1)
+                if start_cycle > curr:
+                    last_write[w] = start_cycle
 
-        if current_instr:
-            instrs.append(dict(current_instr))
-            
-        return instrs
+        # Convert schedule to list of dicts
+        return [dict(s) for s in schedule]
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -306,35 +325,72 @@ class KernelBuilder:
 
         # Main loop bodies
         all_slots = []
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_node_vals = self.alloc_scratch("v_node_vals", VLEN)
-        v_target_node_addrs = [self.alloc_scratch(f"node_addr_{vi}") for vi in range(VLEN)]
+        
+        # We process batches in groups of K to fill the pipeline
+        K = 16
+        num_vec_batches = batch_size // VLEN
+        
+        # Scratch registers for the loop
+        # We need independent temporaries for each of the K interleaved batches
+        batch_temps = []
+        for k in range(K):
+            temps = {
+                "v_tmp1": self.alloc_scratch(f"v_tmp1_{k}", VLEN),
+                "v_tmp2": self.alloc_scratch(f"v_tmp2_{k}", VLEN),
+                "v_node_vals": self.alloc_scratch(f"v_node_vals_{k}", VLEN),
+                "v_target_node_addrs": [self.alloc_scratch(f"node_addr_{k}_{vi}") for vi in range(VLEN)],
+            }
+            batch_temps.append(temps)
 
         for round in range(rounds):
-            for i in range(batch_size // VLEN):
-                # Gather tree node values
-                for vi in range(VLEN):
-                    v_idx_addr = v_indices[i] + vi
-                    all_slots.append(("alu", ("+", v_target_node_addrs[vi], self.scratch["forest_values_p"], v_idx_addr)))
-                    all_slots.append(("load", ("load", v_node_vals + vi, v_target_node_addrs[vi])))
+            for i_base in range(0, num_vec_batches, K):
+                # Interleave operations for K batches
+                # 1. Gather all node values for K batches
+                for k in range(K):
+                    if i_base + k >= num_vec_batches: break
+                    i = i_base + k
+                    temps = batch_temps[k]
+                    
+                    for vi in range(VLEN):
+                        v_idx_addr = v_indices[i] + vi
+                        all_slots.append(("alu", ("+", temps["v_target_node_addrs"][vi], self.scratch["forest_values_p"], v_idx_addr)))
+                        all_slots.append(("load", ("load", temps["v_node_vals"] + vi, temps["v_target_node_addrs"][vi])))
                 
-                # val = val ^ node_val
-                all_slots.append(("valu", ("^", v_values[i], v_values[i], v_node_vals)))
+                # 2. XOR (val ^ node_val) for K batches
+                for k in range(K):
+                    if i_base + k >= num_vec_batches: break
+                    i = i_base + k
+                    temps = batch_temps[k]
+                    all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
+
+                # 3. Hash for K batches - Interleaved stages
+                # To maximize parallelism, we can interleave the stages across batches?
+                # Actually, simply appending to all_slots let the packer do the interleaving.
+                # The packer is greedy, so valid ops from later batches will fill holes in earlier ones.
+                for k in range(K):
+                    if i_base + k >= num_vec_batches: break
+                    i = i_base + k
+                    temps = batch_temps[k]
+                    all_slots.extend(self.build_hash_vec(v_values[i], temps["v_tmp1"], temps["v_tmp2"]))
                 
-                # val = myhash(val)
-                all_slots.extend(self.build_hash_vec(v_values[i], v_tmp1, v_tmp2))
-                
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                all_slots.append(("valu", ("%", v_tmp1, v_values[i], two_v)))
-                all_slots.append(("valu", ("==", v_tmp1, v_tmp1, zero_v)))
-                all_slots.append(("flow", ("vselect", v_tmp2, v_tmp1, one_v, two_v)))
-                all_slots.append(("valu", ("*", v_indices[i], v_indices[i], two_v)))
-                all_slots.append(("valu", ("+", v_indices[i], v_indices[i], v_tmp2)))
-                
-                # idx = 0 if idx >= n_nodes else idx
-                all_slots.append(("valu", ("<", v_tmp1, v_indices[i], n_nodes_v)))
-                all_slots.append(("flow", ("vselect", v_indices[i], v_tmp1, v_indices[i], zero_v)))
+                # 4. Update indices for K batches
+                for k in range(K):
+                    if i_base + k >= num_vec_batches: break
+                    i = i_base + k
+                    temps = batch_temps[k]
+                    
+                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                    all_slots.append(("valu", ("%", temps["v_tmp1"], v_values[i], two_v)))
+                    all_slots.append(("valu", ("==", temps["v_tmp1"], temps["v_tmp1"], zero_v)))
+                    # Replace vselect with arithmetic: val_to_add = 2 - v_tmp1 (since v_tmp1 is 1 if even, 0 if odd)
+                    all_slots.append(("valu", ("-", temps["v_tmp2"], two_v, temps["v_tmp1"])))
+                    all_slots.append(("valu", ("*", v_indices[i], v_indices[i], two_v)))
+                    all_slots.append(("valu", ("+", v_indices[i], v_indices[i], temps["v_tmp2"])))
+                    
+                    # Wrap around
+                    # idx = idx * (idx < n_nodes)
+                    all_slots.append(("valu", ("<", temps["v_tmp1"], v_indices[i], n_nodes_v)))
+                    all_slots.append(("valu", ("*", v_indices[i], v_indices[i], temps["v_tmp1"])))
 
         # Store back everything at the end
         for i in range(batch_size // VLEN):
