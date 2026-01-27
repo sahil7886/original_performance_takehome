@@ -104,6 +104,21 @@ def main():
     ipc = total_insts / cycles if cycles else 0.0
     print(f"Instructions Per Cycle: {ipc:.2f}")
 
+    print("")
+    print("Elite Diagnostics:")
+    load_ops = stats["engine_counts"].get("load", 0)
+    valu_ops = stats["engine_counts"].get("valu", 0)
+    store_ops = stats["engine_counts"].get("store", 0)
+    
+    load_pressure = load_ops / cycles if cycles else 0
+    compute_ratio = valu_ops / (load_ops + store_ops) if (load_ops + store_ops) else 0
+    # Total capacity = sum(SLOT_LIMITS[engine] for engine in SLOT_LIMITS if engine != "debug")
+    # alu:12, valu:6, load:2, store:2, flow:1 -> 23 slots
+    packing_density = total_insts / (cycles * 23) if cycles else 0
+
+    print(f"Memory Pressure:  {load_pressure:.2f} / 2.00 (Loads per Cycle)")
+    print(f"Compute Ratio:    {compute_ratio:.2f} (VALU Ops per Memory Op)")
+    print(f"Packing Density:  {packing_density*100:.1f}% of total hardware capacity used")
 
 if __name__ == "__main__":
     main()
