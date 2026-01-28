@@ -316,7 +316,7 @@ class KernelBuilder:
         v_node_val_1 = self.alloc_scratch("v_node_val_1", VLEN)
         v_node_val_2 = self.alloc_scratch("v_node_val_2", VLEN)
 
-        # Preload level-2 and level-3 nodes into vector scratch (broadcasted)
+        # Preload level-2 nodes into vector scratch (broadcasted)
         t_cache_addr = self.alloc_scratch("t_cache_addr")
         t_cache_val = self.alloc_scratch("t_cache_val")
         v_cache_l2 = self.alloc_scratch("v_cache_l2", 4 * VLEN)  # idx 3..6
@@ -338,6 +338,7 @@ class KernelBuilder:
         pre_slots.append(("valu", ("vbroadcast", v_node_val_1, t_node_val_1)))
         pre_slots.append(("valu", ("vbroadcast", v_node_val_2, t_node_val_2)))
 
+        # Cache level 2 nodes (indices 3-6)
         for i in range(4):
             node_idx = 3 + i
             pre_slots.append(
@@ -358,7 +359,8 @@ class KernelBuilder:
         all_slots.extend(pre_slots)
         
         # We process batches in groups of K to fill the pipeline
-        K = 29
+        K = 32
+        PIPE_CHUNK = 32
         num_vec_batches = batch_size // VLEN
         
         # Scratch registers for the loop
@@ -395,66 +397,148 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         # Wavefront schedule across rounds and batches to overlap loads with compute
+        # Hash stages are interleaved across active batches to reduce tight RAW chains.
         for i_base in range(0, num_vec_batches, K):
             k_end = min(K, num_vec_batches - i_base)
             for t in range(rounds + k_end - 1):
+                active = []
                 for k in range(k_end):
                     r = t - k
-                    if r < 0 or r >= rounds:
-                        continue
+                    if 0 <= r < rounds:
+                        active.append((k, r))
+                if not active:
+                    continue
 
-                    level = r % (forest_height + 1)
-                    level_base = None
-                    if level >= 3:
-                        level_base = self.scratch_const(7 + (1 << level) - 1)
+                # Process active batches in chunks to mix gather + compute earlier
+                for c in range(0, len(active), PIPE_CHUNK):
+                    group = active[c : c + PIPE_CHUNK]
 
-                    i = i_base + k
-                    temps = batch_temps[k]
+                    # 1. Gather node values for this chunk
+                    addr_batches = []
+                    for k, r in group:
+                        level = r % (forest_height + 1)
+                        level_base = None
+                        if level >= 4:
+                            level_base = self.scratch_const(7 + (1 << level) - 1)
 
-                    # 1. Gather node value for this batch/round
-                    if level == 0:
-                        all_slots.append(("valu", ("+", temps["v_node_vals"], v_root_val, zero_v)))
-                    elif level == 1:
-                        all_slots.append(
-                            ("flow", ("vselect", temps["v_node_vals"], v_indices[i], v_node_val_2, v_node_val_1))
-                        )
-                    elif level == 2:
-                        # rel is already in range 0..3, select via two bits
-                        all_slots.append(("valu", ("&", temps["v_tmp2"], v_indices[i], one_v)))  # bit0
-                        all_slots.append(("valu", (">>", temps["v_tmp1"], v_indices[i], one_v)))  # bit1
-                        # low = bit0 ? node4 : node3
-                        all_slots.append(
-                            ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp2"], v_cache_l2 + 1 * VLEN, v_cache_l2 + 0 * VLEN))
-                        )
-                        # high = bit0 ? node6 : node5  (overwrite bit0 after read)
-                        all_slots.append(
-                            ("flow", ("vselect", temps["v_tmp2"], temps["v_tmp2"], v_cache_l2 + 3 * VLEN, v_cache_l2 + 2 * VLEN))
-                        )
-                        # final = bit1 ? high : low
-                        all_slots.append(
-                            ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], temps["v_tmp2"], temps["v_node_vals"]))
-                        )
-                    else:
-                        # Regular gather (use level base + rel)
-                        for vi in range(VLEN):
-                            v_idx_addr = v_indices[i] + vi
-                            all_slots.append(("alu", ("+", temps["v_tmp1"] + vi, level_base, v_idx_addr)))
+                        i = i_base + k
+                        temps = batch_temps[k]
+
+                        if level == 0:
+                            all_slots.append(("valu", ("+", temps["v_node_vals"], v_root_val, zero_v)))
+                        elif level == 1:
+                            all_slots.append(
+                                ("flow", ("vselect", temps["v_node_vals"], v_indices[i], v_node_val_2, v_node_val_1))
+                            )
+                        elif level == 2:
+                            # rel is already in range 0..3, select via two bits
+                            all_slots.append(("valu", ("&", temps["v_tmp2"], v_indices[i], one_v)))  # bit0
+                            all_slots.append(("valu", (">>", temps["v_tmp1"], v_indices[i], one_v)))  # bit1
+                            # low = bit0 ? node4 : node3
+                            all_slots.append(
+                                ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp2"], v_cache_l2 + 1 * VLEN, v_cache_l2 + 0 * VLEN))
+                            )
+                            # high = bit0 ? node6 : node5  (overwrite bit0 after read)
+                            all_slots.append(
+                                ("flow", ("vselect", temps["v_tmp2"], temps["v_tmp2"], v_cache_l2 + 3 * VLEN, v_cache_l2 + 2 * VLEN))
+                            )
+                            # final = bit1 ? high : low
+                            all_slots.append(
+                                ("flow", ("vselect", temps["v_node_vals"], temps["v_tmp1"], temps["v_tmp2"], temps["v_node_vals"]))
+                            )
+                        elif level == 3:
+                            # Level 3: use regular gather (8 loads per batch)
+                            level_base = self.scratch_const(7 + (1 << 3) - 1)  # = 14
+                            for vi in range(VLEN):
+                                v_idx_addr = v_indices[i] + vi
+                                all_slots.append(("alu", ("+", temps["v_tmp1"] + vi, level_base, v_idx_addr)))
+                            addr_batches.append(k)
+                        else:
+                            # Regular gather (use level base + rel)
+                            for vi in range(VLEN):
+                                v_idx_addr = v_indices[i] + vi
+                                all_slots.append(("alu", ("+", temps["v_tmp1"] + vi, level_base, v_idx_addr)))
+                            addr_batches.append(k)
+
+                    for k in addr_batches:
+                        temps = batch_temps[k]
                         for vi in range(VLEN):
                             all_slots.append(("load", ("load_offset", temps["v_node_vals"], temps["v_tmp1"], vi)))
 
-                    # 2. XOR (val ^ node_val)
-                    all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
+                    # 2. XOR (val ^ node_val) for this chunk
+                    for k, _ in group:
+                        i = i_base + k
+                        temps = batch_temps[k]
+                        all_slots.append(("valu", ("^", v_values[i], v_values[i], temps["v_node_vals"])))
 
-                    # 3. Hash
-                    all_slots.extend(self.build_hash_vec(v_values[i], temps["v_tmp1"], temps["v_tmp2"]))
+                    # 3. Hash stages interleaved across this chunk
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        if hi == 0:
+                            vv_mul = self.v_const(4097)
+                            vv_add = self.v_const(val1)
+                            for k, _ in group:
+                                i = i_base + k
+                                v_val_addr = v_values[i]
+                                all_slots.append(("valu", ("multiply_add", v_val_addr, v_val_addr, vv_mul, vv_add)))
+                        elif hi == 2:
+                            vv_mul = self.v_const(33)
+                            vv_add = self.v_const(val1)
+                            for k, _ in group:
+                                i = i_base + k
+                                v_val_addr = v_values[i]
+                                all_slots.append(("valu", ("multiply_add", v_val_addr, v_val_addr, vv_mul, vv_add)))
+                        elif hi == 4:
+                            vv_mul = self.v_const(9)
+                            vv_add = self.v_const(val1)
+                            for k, _ in group:
+                                i = i_base + k
+                                v_val_addr = v_values[i]
+                                all_slots.append(("valu", ("multiply_add", v_val_addr, v_val_addr, vv_mul, vv_add)))
+                        else:
+                            vv1 = self.v_const(val1)
+                            vv3 = self.v_const(val3)
+                            # Stage op1 for this chunk
+                            for k, _ in group:
+                                i = i_base + k
+                                temps = batch_temps[k]
+                                v_val_addr = v_values[i]
+                                all_slots.append(("valu", (op1, temps["v_tmp1"], v_val_addr, vv1)))
+                            # Stage op3 for this chunk
+                            for k, _ in group:
+                                i = i_base + k
+                                temps = batch_temps[k]
+                                v_val_addr = v_values[i]
+                                all_slots.append(("valu", (op3, temps["v_tmp2"], v_val_addr, vv3)))
+                            # Combine for this chunk
+                            for k, _ in group:
+                                i = i_base + k
+                                temps = batch_temps[k]
+                                v_val_addr = v_values[i]
+                                all_slots.append(("valu", (op2, v_val_addr, temps["v_tmp1"], temps["v_tmp2"])))
 
-                    # 4. Update indices (not needed after final round)
-                    if r != rounds - 1:
+                    # 4. Update indices for this chunk (not needed after final round)
+                    # Stage the mask generation to increase distance from the consume.
+                    for k, r in group:
+                        if r == rounds - 1:
+                            continue
+                        i = i_base + k
+                        temps = batch_temps[k]
+                        level = r % (forest_height + 1)
+
                         if level == forest_height:
                             all_slots.append(("valu", ("+", v_indices[i], zero_v, zero_v)))
                         else:
                             all_slots.append(("valu", ("&", temps["v_tmp1"], v_values[i], one_v)))
-                            all_slots.append(("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"])))
+
+                    for k, r in group:
+                        if r == rounds - 1:
+                            continue
+                        level = r % (forest_height + 1)
+                        if level == forest_height:
+                            continue
+                        i = i_base + k
+                        temps = batch_temps[k]
+                        all_slots.append(("valu", ("multiply_add", v_indices[i], v_indices[i], two_v, temps["v_tmp1"])))
 
         # Store back values at the end (indices are not required for correctness)
         for i in range(batch_size // VLEN):
